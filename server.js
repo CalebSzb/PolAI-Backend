@@ -1053,6 +1053,11 @@ app.get('/api/health', (req, res) => {
         timestamp: new Date().toISOString()
     });
 });
+
+    // Root endpoint for quick verification
+    app.get('/', (req, res) => {
+        res.send('PolAI Backend is running successfully 🚀');
+    });
 // Batch analysis endpoint
 app.post('/api/analyze/batch', async (req, res) => {
     try {
