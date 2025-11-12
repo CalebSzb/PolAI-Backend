@@ -1,7 +1,7 @@
 {
   "name": "polai-backend",
-  "version": "1.0.0",
-  "description": "Privacy Policy Analysis AI Backend",
+  "version": "2.0.0",
+  "description": "PolAI Backend - Privacy Policy Analysis API",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -18,5 +18,15 @@
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
-  }
+  },
+  "engines": {
+    "node": "18.x"
+  },
+  "keywords": [
+    "privacy",
+    "ai",
+    "analysis"
+  ],
+  "author": "CalebSzb",
+  "license": "MIT"
 }

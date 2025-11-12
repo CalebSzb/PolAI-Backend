@@ -6,6 +6,10 @@ const cheerio = require('cheerio');
 const { OpenAI } = require('openai');
 const app = express();
 const PORT = process.env.PORT || 3001;
+// Path to local DB file (useful when mounting a persistent disk on Render)
+const DB_PATH = process.env.DB_PATH || './polai.db';
+
+console.log('DB_PATH:', DB_PATH);
 // Middleware
 app.use(cors());
 app.use(express.json());
@@ -1036,10 +1040,16 @@ app.post('/api/analyze', async (req, res) => {
 app.get('/api/health', (req, res) => {
     res.json({
         status: 'healthy',
-        service: 'PolAI Backend v2.0',
+        service: 'PolAI Backend v2.1',
         ai_provider: AI_PROVIDER,
         mistral_configured: !!MISTRAL_API_KEY,
         openai_configured: !!OPENAI_API_KEY,
+        endpoints: {
+            analyze_url: '/api/analyze',
+            analyze_text: '/api/analyze-text',
+            batch_analyze: '/api/analyze/batch',
+            scan_app: '/api/scan-app'
+        },
         timestamp: new Date().toISOString()
     });
 });
@@ -1107,6 +1117,193 @@ app.post('/api/analyze/batch', async (req, res) => {
         });
     }
 });
+
+// Text analysis endpoint (for OCR results)
+app.post('/api/analyze-text', async (req, res) => {
+    try {
+        const { text } = req.body;
+       
+        if (!text || text.trim().length < 50) {
+            return res.status(400).json({ 
+                success: false,
+                error: 'Text too short. Please provide at least 50 characters of policy text.' 
+            });
+        }
+
+        console.log(`\n📄 Text Analysis Request: ${text.length} characters`);
+
+        // Analyze the text directly
+        let analysis;
+        try {
+            if (AI_PROVIDER === 'openai') {
+                analysis = await analyzePolicyWithOpenAI(text, 'Direct Text Input');
+                analysis.analysis_method = 'openai';
+            } else {
+                analysis = await analyzePolicyWithMistral(text, 'Direct Text Input');
+                analysis.analysis_method = 'mistral_ai';
+            }
+        } catch (aiError) {
+            console.error('⚠️ AI analysis failed, using enhanced fallback:', aiError.message);
+            analysis = performRuleBasedAnalysis(text, 'Direct Text Input');
+            analysis.ai_error = aiError.message;
+        }
+
+        console.log(`✓ Text analysis complete\n`);
+       
+        res.json({
+            success: true,
+            source: 'text',
+            analysis: analysis,
+            text_length: text.length,
+            timestamp: new Date().toISOString()
+        });
+    } catch (error) {
+        console.error('✗ Text analysis error:', error.message);
+        res.status(500).json({
+            success: false,
+            error: error.message,
+            timestamp: new Date().toISOString()
+        });
+    }
+});
+
+// App scanning endpoint (for background task)
+app.post('/api/scan-app', async (req, res) => {
+    try {
+        const { packageName, policyUrl } = req.body;
+       
+        if (!packageName && !policyUrl) {
+            return res.status(400).json({ 
+                success: false,
+                error: 'Package name or policy URL required' 
+            });
+        }
+
+        console.log(`\n📱 App Scan Request: ${packageName || 'Unknown'}`);
+
+        let url = policyUrl;
+
+        // If no URL provided, try to find it
+        if (!url && packageName) {
+            url = await findAppPrivacyPolicy(packageName);
+            
+            if (!url) {
+                return res.status(404).json({
+                    success: false,
+                    error: 'Could not find privacy policy for this app',
+                    packageName
+                });
+            }
+        }
+
+        // Extract and analyze policy
+        const policyText = await extractPolicyText(url);
+        let analysis;
+       
+        try {
+            if (AI_PROVIDER === 'openai') {
+                analysis = await analyzePolicyWithOpenAI(policyText, url);
+                analysis.analysis_method = 'openai';
+            } else {
+                analysis = await analyzePolicyWithMistral(policyText, url);
+                analysis.analysis_method = 'mistral_ai';
+            }
+        } catch (aiError) {
+            analysis = performRuleBasedAnalysis(policyText, url);
+            analysis.ai_error = aiError.message;
+        }
+
+        // Calculate simple score
+        const score = calculateSimpleScore(analysis);
+
+        console.log(`✓ App scan complete - Score: ${score}/100\n`);
+       
+        res.json({
+            success: true,
+            packageName,
+            url,
+            score,
+            analysis,
+            timestamp: new Date().toISOString()
+        });
+    } catch (error) {
+        console.error('✗ App scan error:', error.message);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// Helper: Find app privacy policy
+async function findAppPrivacyPolicy(packageName) {
+    try {
+        // Try Play Store
+        const playStoreUrl = `https://play.google.com/store/apps/details?id=${packageName}`;
+        const response = await axios.get(playStoreUrl, {
+            headers: getHeaders(playStoreUrl),
+            timeout: 10000
+        });
+
+        const $ = cheerio.load(response.data);
+        
+        // Look for privacy policy link
+        const privacyLink = $('a[href*="privacy"]').first().attr('href') ||
+                          $('a[href*="policy"]').first().attr('href');
+
+        if (privacyLink) {
+            return privacyLink.startsWith('http') ? privacyLink : `https://play.google.com${privacyLink}`;
+        }
+
+        // Try common URLs
+        const domain = packageName.split('.').slice(-2).join('.');
+        const commonUrls = [
+            `https://${domain}/privacy`,
+            `https://${domain}/privacy-policy`,
+            `https://www.${domain}/privacy`
+        ];
+
+        for (const url of commonUrls) {
+            try {
+                await axios.head(url, { timeout: 3000 });
+                return url;
+            } catch (e) {
+                continue;
+            }
+        }
+
+        return null;
+    } catch (error) {
+        console.error('Error finding privacy policy:', error.message);
+        return null;
+    }
+}
+
+// Helper: Calculate simple score
+function calculateSimpleScore(analysis) {
+    let score = 100;
+    
+    if (analysis.data_sharing?.third_parties) {
+        score -= analysis.data_sharing.user_control ? 15 : 25;
+    }
+    
+    if (!analysis.user_rights?.deletion) score -= 20;
+    if (!analysis.user_rights?.access) score -= 10;
+    if (!analysis.user_rights?.opt_out) score -= 10;
+    
+    if (analysis.cookies_tracking?.cookies_used && !analysis.cookies_tracking?.opt_out_available) {
+        score -= 15;
+    }
+    
+    if (!analysis.security_measures?.encryption_mentioned) score -= 10;
+    
+    if (!analysis.compliance?.gdpr_mentioned && !analysis.compliance?.ccpa_mentioned) {
+        score -= 10;
+    }
+    
+    return Math.max(0, score);
+}
+
 // Start server
 app.listen(PORT, () => {
     console.log('\n╔════════════════════════════════════════╗');
